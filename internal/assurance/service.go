@@ -17,9 +17,16 @@ type Service struct {
 }
 
 func NewService(repo *repository.Repository) *Service {
+	return NewServiceWithClock(repo, time.Now)
+}
+
+// NewServiceWithClock wires a service with a controllable clock. Production
+// uses time.Now; bounded checks inject a fixed clock to exercise retention
+// boundaries.
+func NewServiceWithClock(repo *repository.Repository, now func() time.Time) *Service {
 	return &Service{
 		repository: repo,
-		now:        time.Now,
+		now:        now,
 	}
 }
 
@@ -312,11 +319,9 @@ func (s *Service) Purge(ctx context.Context, input contracts.PurgeRequest) (cont
 	if cutoff.IsZero() {
 		return contracts.PurgeResponse{}, fmt.Errorf("%w: sealed_before is required", domain.ErrInvalidInput)
 	}
-	ids, err := s.repository.PurgeCandidates(ctx, cutoff)
-	if err != nil {
-		return contracts.PurgeResponse{}, err
-	}
-	stats, err := s.repository.Purge(ctx, ids)
+	// Selection and deletion happen in one repository commit, so the sweep
+	// cannot race a case that is still being reviewed, reworked, or sealed.
+	stats, err := s.repository.PurgeBefore(ctx, cutoff)
 	if err != nil {
 		return contracts.PurgeResponse{}, err
 	}

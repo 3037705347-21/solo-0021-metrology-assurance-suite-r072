@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"net/http"
+	"time"
 
 	"example.com/solo-0021-metrology-assurance-suite/internal/assurance"
 	"example.com/solo-0021-metrology-assurance-suite/internal/httpapi"
@@ -9,7 +10,13 @@ import (
 )
 
 func NewHandler() http.Handler {
+	return NewHandlerWithClock(time.Now)
+}
+
+// NewHandlerWithClock wires the service with a controllable clock. Production
+// callers pass time.Now; bounded checks inject a fixed clock.
+func NewHandlerWithClock(now func() time.Time) http.Handler {
 	repo := repository.New()
-	service := assurance.NewService(repo)
+	service := assurance.NewServiceWithClock(repo, now)
 	return httpapi.NewHandler(service)
 }

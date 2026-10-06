@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -109,16 +110,6 @@ func (s Snapshot) AllCases() []domain.VerificationCase {
 	return result
 }
 
-func (s Snapshot) PurgeableCases(cutoff time.Time) []domain.VerificationCase {
-	var result []domain.VerificationCase
-	for _, item := range s.cases {
-		if item.PurgeableBefore(cutoff) {
-			result = append(result, item)
-		}
-	}
-	return result
-}
-
 func (s Snapshot) Evidence(caseID string) (domain.EvidenceSeal, []domain.Measurement, []domain.AuditEvent, bool) {
 	seal, exists := s.seals[caseID]
 	if !exists {
@@ -201,6 +192,14 @@ func (m *Mutation) ActiveCaseForDevice(deviceID string) (domain.VerificationCase
 	return domain.VerificationCase{}, false
 }
 
+func (m *Mutation) AllCases() []domain.VerificationCase {
+	result := make([]domain.VerificationCase, 0, len(m.cases))
+	for _, item := range m.cases {
+		result = append(result, item)
+	}
+	return result
+}
+
 func (m *Mutation) AppendMeasurement(item domain.Measurement) error {
 	if _, exists := m.cases[item.CaseID]; !exists {
 		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
@@ -240,36 +239,56 @@ func (m *Mutation) Events(caseID string) []domain.AuditEvent {
 	return result
 }
 
-func (m *Mutation) PurgeCase(caseID string) PurgeStats {
+// purgeCaseFacts removes one case together with every fact that belongs to it:
+// its measurements, its evidence seal, and its audit events. All four
+// collections move together inside the same mutation, so a released case can
+// never leave orphaned evidence behind. The caller is responsible for having
+// rechecked the retention predicate against this same mutation.
+func (m *Mutation) purgeCaseFacts(caseID string) PurgeStats {
 	stats := PurgeStats{}
 	if _, exists := m.cases[caseID]; !exists {
 		return stats
 	}
 	stats.Cases = 1
 	stats.CaseIDs = append(stats.CaseIDs, caseID)
+
+	if items, ok := m.measurements[caseID]; ok {
+		stats.Measurements = len(items)
+		delete(m.measurements, caseID)
+	}
+	if _, ok := m.seals[caseID]; ok {
+		stats.Seals = 1
+		delete(m.seals, caseID)
+	}
+	kept := m.events[:0]
+	for _, item := range m.events {
+		if item.CaseID == caseID {
+			stats.Events++
+			continue
+		}
+		kept = append(kept, item)
+	}
+	m.events = kept
 	delete(m.cases, caseID)
 	return stats
 }
 
-// PurgeCandidates returns the case ids the retention sweep may release.
-func (r *Repository) PurgeCandidates(ctx context.Context, cutoff time.Time) ([]string, error) {
-	var ids []string
-	err := r.Read(ctx, func(snapshot Snapshot) error {
-		for _, item := range snapshot.PurgeableCases(cutoff) {
-			ids = append(ids, item.ID)
-		}
-		return nil
-	})
-	return ids, err
-}
-
-// Purge removes the named cases together with their retained evidence.
-func (r *Repository) Purge(ctx context.Context, caseIDs []string) (PurgeStats, error) {
+// PurgeBefore runs one atomic retention sweep. It holds the mutation lock for
+// the whole decision, so eligibility is rechecked against the exact state that
+// is committed: a case cannot be sealed or reopened between selection and
+// deletion. Only cases that are sealed and whose seal predates the cutoff are
+// released, each together with all of its measurements, seal, and audit
+// events. Devices and non-matching cases are never touched.
+func (r *Repository) PurgeBefore(ctx context.Context, cutoff time.Time) (PurgeStats, error) {
 	var stats PurgeStats
 	err := r.Mutate(ctx, func(m *Mutation) error {
-		for _, caseID := range caseIDs {
-			stats = stats.Add(m.PurgeCase(caseID))
+		for _, item := range m.AllCases() {
+			if !item.PurgeableBefore(cutoff) {
+				continue
+			}
+			stats = stats.Add(m.purgeCaseFacts(item.ID))
 		}
+		sort.Strings(stats.CaseIDs)
 		return nil
 	})
 	return stats, err

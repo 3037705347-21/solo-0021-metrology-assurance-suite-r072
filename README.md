@@ -22,6 +22,7 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow retention-purge
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the
@@ -42,6 +43,8 @@ or extend these smoke checks with red/green verification tests.
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+- `POST /retention/purge`
+- `GET /evidence/{id}`
 
 ## Layout
 

@@ -106,11 +106,16 @@ func (c *VerificationCase) Seal(at time.Time) error {
 }
 
 // PurgeableBefore reports whether the retention sweep may release this case.
+//
+// Only a case that has actually been sealed may be released, and only once its
+// seal has fallen before the retention cutoff. A case that is still awaiting a
+// measurement, awaiting review, or awaiting rework is never purgeable no matter
+// when it was last updated, so in-progress work survives every sweep.
 func (c VerificationCase) PurgeableBefore(cutoff time.Time) bool {
-	if c.SealedAt != nil {
-		return c.SealedAt.Before(cutoff)
+	if c.State != CaseSealed || c.SealedAt == nil {
+		return false
 	}
-	return c.UpdatedAt.Before(cutoff)
+	return c.SealedAt.Before(cutoff)
 }
 
 func isFinite(value float64) bool {

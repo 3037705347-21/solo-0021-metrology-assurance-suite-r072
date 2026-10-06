@@ -24,10 +24,22 @@ type apiResponse struct {
 	Raw    string
 }
 
+type apiClient interface {
+	request(method, path string, body any) (apiResponse, error)
+	createDevice(tag string) (string, error)
+	openCase(deviceID string) (apiResponse, error)
+	recordMeasurement(caseID string, observed float64, technician string) (apiResponse, error)
+}
+
 type harness struct {
 	baseURL string
 	client  *http.Client
 	server  *httptest.Server
+}
+
+type clockHarness struct {
+	*harness
+	current time.Time
 }
 
 func main() {
@@ -40,6 +52,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"retention-purge":          checkRetentionPurge,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -384,6 +397,192 @@ func newHarness() *harness {
 	}
 }
 
+// checkRetentionPurge exercises the retention sweep end to end:
+//   - a case sealed before the cutoff is released together with its
+//     measurements, seal, and audit events (no orphaned evidence);
+//   - a case sealed after the cutoff stays fully readable (within retention);
+//   - awaiting, review-ready, and recheck-required cases are untouched and can
+//     still be reworked, reviewed, and sealed;
+//   - device records are never affected.
+func checkRetentionPurge() error {
+	base := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
+	cutoff := base.AddDate(0, 1, 0)
+	h := newClockHarness(base)
+	defer h.close()
+
+	purge := func() (apiResponse, error) {
+		return h.request(http.MethodPost, "/retention/purge", map[string]any{
+			"sealed_before": cutoff.Format(time.RFC3339),
+			"actor":         "steward-chen",
+		})
+	}
+
+	// Old sealed case: sealed at the base time, well before the cutoff.
+	oldDevice, err := h.createDevice("MET-2001")
+	if err != nil {
+		return err
+	}
+	oldCase, err := readyCaseOn(h, oldDevice)
+	if err != nil {
+		return err
+	}
+	if _, err := h.sealCase(oldCase, "Reviewer-Old", "old accepted work sealed"); err != nil {
+		return err
+	}
+
+	// Advance past the cutoff, then build the live workload.
+	h.advance(cutoff.Sub(base) + 24*time.Hour)
+
+	recentCase, err := readyCaseOn(h, mustCreateDevice(h, "MET-2002"))
+	if err != nil {
+		return err
+	}
+	if _, err := h.sealCase(recentCase, "Reviewer-Recent", "recently sealed, within retention"); err != nil {
+		return err
+	}
+
+	awaitingCase, err := openCaseOn(h, mustCreateDevice(h, "MET-2003"))
+	if err != nil {
+		return err
+	}
+
+	readyCase, err := readyCaseOn(h, mustCreateDevice(h, "MET-2004"))
+	if err != nil {
+		return err
+	}
+
+	recheckCase, err := rejectedCaseOn(h, mustCreateDevice(h, "MET-2005"))
+	if err != nil {
+		return err
+	}
+
+	// Sanity: every case and the old case's evidence are readable first.
+	if err := expectReadableCase(h, oldCase); err != nil {
+		return err
+	}
+	if err := expectEvidence(h, oldCase); err != nil {
+		return err
+	}
+
+	response, err := purge()
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(response, http.StatusOK); err != nil {
+		return err
+	}
+	if got := nestedInt(response.Body, "purged_cases"); got != 1 {
+		return fmt.Errorf("purged_cases = %d, want 1", got)
+	}
+	if got := nestedInt(response.Body, "purged_measurements"); got != 1 {
+		return fmt.Errorf("purged_measurements = %d, want 1", got)
+	}
+	if got := nestedInt(response.Body, "purged_seals"); got != 1 {
+		return fmt.Errorf("purged_seals = %d, want 1", got)
+	}
+	if got := nestedInt(response.Body, "purged_events"); got != 3 {
+		return fmt.Errorf("purged_events = %d, want 3 (open, accepted, sealed)", got)
+	}
+	ids, err := nestedStringSlice(response.Body, "case_ids")
+	if err != nil {
+		return err
+	}
+	if len(ids) != 1 || ids[0] != oldCase {
+		return fmt.Errorf("case_ids = %v, want [%s]", ids, oldCase)
+	}
+
+	// The released case must be gone by every read path, including evidence.
+	if err := expectNotFound(h.request(http.MethodGet, "/cases/"+oldCase, nil)); err != nil {
+		return fmt.Errorf("released case still readable: %w", err)
+	}
+	if err := expectNotFound(h.request(http.MethodGet, "/cases/"+oldCase+"/events", nil)); err != nil {
+		return fmt.Errorf("released case events still readable: %w", err)
+	}
+	if err := expectNotFound(h.request(http.MethodGet, "/evidence/"+oldCase, nil)); err != nil {
+		return fmt.Errorf("orphaned evidence still readable: %w", err)
+	}
+	// Its device record survives.
+	if err := expectReadableDevice(h, oldDevice); err != nil {
+		return fmt.Errorf("device of released case was affected: %w", err)
+	}
+
+	// The sealed-but-recent case survives with seal, measurement, and events.
+	if err := expectReadableCase(h, recentCase); err != nil {
+		return fmt.Errorf("case sealed within retention was purged: %w", err)
+	}
+	if err := expectEvidence(h, recentCase); err != nil {
+		return fmt.Errorf("evidence of in-retention case was affected: %w", err)
+	}
+
+	// In-progress cases are untouched and still operational.
+	for _, id := range []string{awaitingCase, readyCase, recheckCase} {
+		if err := expectReadableCase(h, id); err != nil {
+			return fmt.Errorf("in-progress case %s was purged: %w", id, err)
+		}
+	}
+	if err := expectState(h, recheckCase, "recheck_required"); err != nil {
+		return err
+	}
+	if _, err := h.request(http.MethodPost, "/cases/"+recheckCase+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "rework after retention sweep",
+	}); err != nil {
+		return err
+	}
+	if err := expectState(h, recheckCase, "awaiting_measurement"); err != nil {
+		return err
+	}
+	if _, err := h.recordMeasurement(recheckCase, 25.1, "Rui"); err != nil {
+		return err
+	}
+	if _, err := h.sealCase(recheckCase, "Reviewer-Rework", "sealed after rework"); err != nil {
+		return err
+	}
+	if err := expectState(h, recheckCase, "sealed"); err != nil {
+		return err
+	}
+	if err := expectState(h, readyCase, "review_ready"); err != nil {
+		return err
+	}
+	if err := expectState(h, awaitingCase, "awaiting_measurement"); err != nil {
+		return err
+	}
+
+	// Everything that remains was sealed (or is still open) after the cutoff,
+	// so a second sweep at the same cutoff releases nothing.
+	response, err = purge()
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(response, http.StatusOK); err != nil {
+		return err
+	}
+	if got := nestedInt(response.Body, "purged_cases"); got != 0 {
+		return fmt.Errorf("second sweep released %d cases, want 0", got)
+	}
+	if err := expectNotFound(h.request(http.MethodGet, "/evidence/"+oldCase, nil)); err != nil {
+		return fmt.Errorf("released evidence reappeared after second sweep: %w", err)
+	}
+	return nil
+}
+
+func newClockHarness(start time.Time) *clockHarness {
+	h := &clockHarness{current: start}
+	server := httptest.NewServer(bootstrap.NewHandlerWithClock(h.now))
+	h.harness = &harness{
+		baseURL: server.URL,
+		client:  server.Client(),
+		server:  server,
+	}
+	return h
+}
+
+func (h *clockHarness) now() time.Time { return h.current }
+
+func (h *clockHarness) advance(d time.Duration) {
+	h.current = h.current.Add(d)
+}
+
 func (h *harness) close() {
 	h.server.Close()
 }
@@ -491,11 +690,27 @@ func (h *harness) readyCase(tag string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return readyCaseOn(h, deviceID)
+}
+
+func mustCreateDevice(h apiClient, tag string) string {
+	id, err := h.createDevice(tag)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
+func openCaseOn(h apiClient, deviceID string) (string, error) {
 	opened, err := h.openCase(deviceID)
 	if err != nil {
 		return "", err
 	}
-	caseID, err := nestedString(opened.Body, "case", "id")
+	return nestedString(opened.Body, "case", "id")
+}
+
+func readyCaseOn(h apiClient, deviceID string) (string, error) {
+	caseID, err := openCaseOn(h, deviceID)
 	if err != nil {
 		return "", err
 	}
@@ -507,6 +722,115 @@ func (h *harness) readyCase(tag string) (string, error) {
 		return "", err
 	}
 	return caseID, nil
+}
+
+func rejectedCaseOn(h apiClient, deviceID string) (string, error) {
+	caseID, err := openCaseOn(h, deviceID)
+	if err != nil {
+		return "", err
+	}
+	response, err := h.recordMeasurement(caseID, 26.5, "Rui")
+	if err != nil {
+		return "", err
+	}
+	if err := expectStatus(response, http.StatusCreated); err != nil {
+		return "", err
+	}
+	return caseID, nil
+}
+
+func (h *harness) sealCase(caseID, reviewer, summary string) (apiResponse, error) {
+	return h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": reviewer,
+		"summary":  summary,
+	})
+}
+
+func expectReadableCase(h apiClient, caseID string) error {
+	response, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	return expectStatus(response, http.StatusOK)
+}
+
+func expectReadableDevice(h apiClient, deviceID string) error {
+	response, err := h.request(http.MethodGet, "/devices/"+deviceID, nil)
+	if err != nil {
+		return err
+	}
+	return expectStatus(response, http.StatusOK)
+}
+
+func expectEvidence(h apiClient, caseID string) error {
+	response, err := h.request(http.MethodGet, "/evidence/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	return expectStatus(response, http.StatusOK)
+}
+
+func expectState(h apiClient, caseID, expected string) error {
+	response, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(response, http.StatusOK); err != nil {
+		return err
+	}
+	state, err := nestedString(response.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != expected {
+		return fmt.Errorf("case %s state = %q, want %q", caseID, state, expected)
+	}
+	return nil
+}
+
+func expectNotFound(response apiResponse, err error) error {
+	if err != nil {
+		return err
+	}
+	if response.Status != http.StatusNotFound {
+		return fmt.Errorf("status = %d, want %d: %s", response.Status, http.StatusNotFound, response.Raw)
+	}
+	return nil
+}
+
+func nestedInt(root map[string]any, path ...string) int {
+	value, err := nestedValue(root, path...)
+	if err != nil {
+		return -1
+	}
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	default:
+		return -1
+	}
+}
+
+func nestedStringSlice(root map[string]any, path ...string) ([]string, error) {
+	value, err := nestedValue(root, path...)
+	if err != nil {
+		return nil, err
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%v is not an array", path)
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		text, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("%v contains a non-string entry", path)
+		}
+		result = append(result, text)
+	}
+	return result, nil
 }
 
 func expectStatus(response apiResponse, expected int) error {
