@@ -109,16 +109,6 @@ func (s Snapshot) AllCases() []domain.VerificationCase {
 	return result
 }
 
-func (s Snapshot) PurgeableCases(cutoff time.Time) []domain.VerificationCase {
-	var result []domain.VerificationCase
-	for _, item := range s.cases {
-		if item.PurgeableBefore(cutoff) {
-			result = append(result, item)
-		}
-	}
-	return result
-}
-
 func (s Snapshot) Evidence(caseID string) (domain.EvidenceSeal, []domain.Measurement, []domain.AuditEvent, bool) {
 	seal, exists := s.seals[caseID]
 	if !exists {
@@ -240,35 +230,54 @@ func (m *Mutation) Events(caseID string) []domain.AuditEvent {
 	return result
 }
 
+// PurgeCase releases one case together with every fact tied to it: its
+// measurements, its evidence seal, and its audit events. It must be called
+// only for a case the caller has already confirmed is eligible. Device
+// records and device-level audit events (empty case id) are never touched.
 func (m *Mutation) PurgeCase(caseID string) PurgeStats {
 	stats := PurgeStats{}
 	if _, exists := m.cases[caseID]; !exists {
 		return stats
 	}
+	delete(m.cases, caseID)
+
+	if values := m.measurements[caseID]; len(values) > 0 {
+		stats.Measurements = len(values)
+		delete(m.measurements, caseID)
+	}
+	if _, exists := m.seals[caseID]; exists {
+		stats.Seals = 1
+		delete(m.seals, caseID)
+	}
+	keptEvents := m.events[:0]
+	for _, item := range m.events {
+		if item.CaseID == caseID {
+			stats.Events++
+			continue
+		}
+		keptEvents = append(keptEvents, item)
+	}
+	m.events = keptEvents
+
 	stats.Cases = 1
 	stats.CaseIDs = append(stats.CaseIDs, caseID)
-	delete(m.cases, caseID)
 	return stats
 }
 
-// PurgeCandidates returns the case ids the retention sweep may release.
-func (r *Repository) PurgeCandidates(ctx context.Context, cutoff time.Time) ([]string, error) {
-	var ids []string
-	err := r.Read(ctx, func(snapshot Snapshot) error {
-		for _, item := range snapshot.PurgeableCases(cutoff) {
-			ids = append(ids, item.ID)
-		}
-		return nil
-	})
-	return ids, err
-}
-
-// Purge removes the named cases together with their retained evidence.
-func (r *Repository) Purge(ctx context.Context, caseIDs []string) (PurgeStats, error) {
+// Purge releases every sealed case whose retention window has elapsed before
+// cutoff. Eligibility is evaluated against the locked state inside one write
+// transaction, and each released case is removed together with its
+// measurements, evidence seal, and audit events, so a reader can never
+// observe a released case or any orphaned fact belonging to one. Unsealed
+// cases and cases sealed at or after the cutoff are left untouched.
+func (r *Repository) Purge(ctx context.Context, cutoff time.Time) (PurgeStats, error) {
 	var stats PurgeStats
 	err := r.Mutate(ctx, func(m *Mutation) error {
-		for _, caseID := range caseIDs {
-			stats = stats.Add(m.PurgeCase(caseID))
+		for _, item := range m.cases {
+			if !item.PurgeableBefore(cutoff) {
+				continue
+			}
+			stats = stats.Add(m.PurgeCase(item.ID))
 		}
 		return nil
 	})

@@ -312,11 +312,7 @@ func (s *Service) Purge(ctx context.Context, input contracts.PurgeRequest) (cont
 	if cutoff.IsZero() {
 		return contracts.PurgeResponse{}, fmt.Errorf("%w: sealed_before is required", domain.ErrInvalidInput)
 	}
-	ids, err := s.repository.PurgeCandidates(ctx, cutoff)
-	if err != nil {
-		return contracts.PurgeResponse{}, err
-	}
-	stats, err := s.repository.Purge(ctx, ids)
+	stats, err := s.repository.Purge(ctx, cutoff)
 	if err != nil {
 		return contracts.PurgeResponse{}, err
 	}
